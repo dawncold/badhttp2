@@ -1,16 +1,16 @@
 from __future__ import print_function
-
-from twisted.internet import reactor
-from twisted.internet.endpoints import connectProtocol, SSL4ClientEndpoint
-from twisted.internet.protocol import Protocol
-from twisted.internet.ssl import optionsForClientTLS
-from hyperframe.frame import SettingsFrame
+import os
 from h2.connection import H2Connection
 from h2.events import (
     ResponseReceived, DataReceived, StreamEnded,
     StreamReset, SettingsAcknowledged, ConnectionTerminated,
 )
-
+from hyperframe.frame import Frame, DataFrame
+from hyperframe.frame import SettingsFrame
+from twisted.internet import reactor
+from twisted.internet._sslverify import OpenSSLCertificateOptions, platformTrust, ClientTLSOptions
+from twisted.internet.endpoints import connectProtocol, SSL4ClientEndpoint
+from twisted.internet.protocol import Protocol
 
 AUTHORITY = u''
 PATH = '/'
@@ -27,7 +27,7 @@ class H2Protocol(Protocol):
         self.conn.initiate_connection()
 
         # This reproduces the error in #396, by changing the header table size.
-        self.conn.update_settings({SettingsFrame.HEADER_TABLE_SIZE: SIZE})
+        self.conn.update_settings({SettingsFrame.HEADER_TABLE_SIZE: SIZE, SettingsFrame.MAX_FRAME_SIZE: 32768})
 
         self.transport.write(self.conn.data_to_send())
 
@@ -60,14 +60,19 @@ class H2Protocol(Protocol):
         data = self.conn.data_to_send()
         if data:
             print(data.hex(':'))
-            if data[:3] == bytes.fromhex('00001d'):
-                new_length = bytes.fromhex('004001')
-                type_flag_bytes = bytes.fromhex('0001')
-                stream_id_bytes = bytes.fromhex('00000001')
-                new_payload_bytes = bytes.fromhex('00' * ((1 << 14) + 1))
-                data = data[:38] + new_length + type_flag_bytes + stream_id_bytes + new_payload_bytes
-                print(data[:70].hex(':'), '...')
-            self.transport.write(data)
+            ptr = 0
+            while True:
+                frame, length = Frame.parse_frame_header(memoryview(data[ptr:ptr + 9]))
+                frame.parse_body(memoryview(data[ptr + 9:ptr + 9 + length]))
+                print(f'Parsed frame: {frame}')
+                if isinstance(frame, DataFrame):
+                    dataframe_bytes = bytes.fromhex('008001') + bytes.fromhex('0001') + bytes.fromhex('00000001') + bytes.fromhex('00' * ((1 << 15) + 1))
+                    self.transport.write(dataframe_bytes)
+                else:
+                    self.transport.write(frame.serialize())
+                ptr += 9 + length
+                if ptr >= len(data):
+                    break
 
     def settingsAcked(self, event):
         # Having received the remote settings change, lets send our request.
@@ -81,7 +86,7 @@ class H2Protocol(Protocol):
         print("")
 
     def handleData(self, data, stream_id):
-        print(data, end='')
+        print(f'received {len(data)} bytes from stream: {stream_id}')
 
     def endStream(self, stream_id):
         self.conn.close_connection()
@@ -91,7 +96,7 @@ class H2Protocol(Protocol):
 
     def sendRequest(self):
         request_headers = [
-            (':method', 'GET'),
+            (':method', 'POST'),
             (':authority', AUTHORITY),
             (':scheme', 'https'),
             (':path', PATH),
@@ -101,11 +106,22 @@ class H2Protocol(Protocol):
         self.conn.send_data(1, b'a', end_stream=True)
         self.request_made = True
 
-options = optionsForClientTLS(
-    hostname=AUTHORITY,
+
+certificateOptions = OpenSSLCertificateOptions(
+    trustRoot=platformTrust(),
     acceptableProtocols=[b'h2'],
 )
+ctx = certificateOptions.getContext()
 
+
+def append_to_key_log_file(key):
+    log_file_path = os.getenv('SSLKEYLOGFILE')
+    with open(log_file_path, 'ab+') as f:
+        f.write(key + b'\n')
+
+
+ctx.set_keylog_callback(lambda _, key: append_to_key_log_file(key))
+options = ClientTLSOptions(AUTHORITY, ctx)
 connectProtocol(
     SSL4ClientEndpoint(reactor, AUTHORITY, 443, options),
     H2Protocol()
